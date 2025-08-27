@@ -1,0 +1,112 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_REGION: ap-northeast-1
+    S3_BUCKET: <S3_BUCKET>
+    LAMBDA_FUNCTION_NAME: <LAMBDA_FUNCTION_NAME>
+    CF_DISTRIBUTION_ID: <CF_DISTRIBUTION_ID>
+    NODE_OPTIONS: --max-old-space-size=2048
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22.16.0
+    commands:
+      - echo "Install toolchain"
+      - node -v
+      - corepack enable
+      - corepack prepare pnpm@9.6.0 --activate
+      - pnpm -v
+
+  pre_build:
+    commands:
+      - echo "Install deps (with cache)"
+      - pnpm install
+
+  build:
+    commands:
+      - echo "Nuxt/Nitro build for aws-lambda"
+      - export NITRO_PRESET=aws-lambda
+      - pnpm build
+
+      # 生成物の確認
+      - ls -la .output
+      - ls -la .output/public || true
+      - ls -la .output/server || true
+
+      # Lambda 用 zip を用意（Nitro が server.zip を出さない場合に備えて自作）
+      - |
+        if [ -f ".output/server/server.zip" ]; then
+          echo "Use server.zip created by Nitro"
+          cp .output/server/server.zip server.zip
+        else
+          echo "Make server.zip from .output/server"
+          cd .output/server
+          zip -r ../../server.zip ./*
+          cd -
+        fi
+
+  post_build:
+    commands:
+      - echo "Upload static assets to S3 with proper cache headers"
+      # ハッシュ付きビルド資産は長期キャッシュ
+      - |
+        aws s3 sync .output/public s3://$S3_BUCKET/ --delete \
+          --cache-control "public,max-age=31536000,immutable" \
+          --exclude "*" \
+          --include "_nuxt/*"
+      # それ以外は短め（必要に応じて調整）
+      - |
+        aws s3 sync .output/public s3://$S3_BUCKET/ --delete \
+          --cache-control "public,max-age=300" \
+          --exclude "_nuxt/*"
+
+      - echo "Update Lambda code"
+      - |
+        aws lambda update-function-code \
+          --function-name "$LAMBDA_FUNCTION_NAME" \
+          --zip-file fileb://server.zip \
+          --region "$AWS_REGION"
+
+      # lambdaのバージョニングの処理
+      - |
+        for i in $(seq 1 60); do
+          STATUS=$(aws lambda get-function-configuration \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --query 'LastUpdateStatus' --output text --region "$AWS_REGION")
+          STATE=$(aws lambda get-function-configuration \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --query 'State' --output text --region "$AWS_REGION")
+
+          echo "Lambda update: LastUpdateStatus=$STATUS State=$STATE"
+          if [ "$STATUS" = "Successful" ] && [ "$STATE" = "Active" ]; then break; fi
+          if [ "$STATUS" = "Failed" ] || [ "$STATE" = "Failed" ]; then
+            echo "Lambda update failed"; exit 1
+          fi
+          sleep 2
+        done
+
+      - |
+        NEW_VERSION=$(
+          aws lambda publish-version \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --description "$(date -u +%FT%TZ)" \
+            --query 'Version' --output text
+          )
+
+      - echo "Published Lambda version -> $NEW_VERSION"
+
+      # skew防止のためキャッシュは残す
+      # - echo "Create CloudFront invalidation (minimal)"
+      # - |
+      #   aws cloudfront create-invalidation \
+      #     --distribution-id "$CF_DISTRIBUTION_ID" \
+      #     --paths "/_nuxt/*" "/index.html"
+artifacts:
+  files:
+    - server.zip
+cache:
+  paths:
+    - "node_modules/**"
+    - "~/.pnpm-store/**"
